@@ -4,6 +4,9 @@ Provides both sync and async methods.  Sync methods are thin wrappers that
 run httpx synchronously; async methods use httpx.AsyncClient.
 
 All methods raise :class:`RespondError` subclasses on non-2xx responses.
+
+Blob upload/download uses server-minted signed URLs — the API key is only used
+to allocate the URL; the actual byte transfer happens without Bearer auth.
 """
 
 from __future__ import annotations
@@ -44,8 +47,7 @@ class RespondClient:
         status = c.get_job(job["job_id"])
 
     Usage (async):
-        async with c.async_client() as ac:
-            job = await ac.submit("my.kind", payload={"x": 1})
+        job = await c.asubmit("my.kind", payload={"x": 1})
     """
 
     def __init__(
@@ -225,31 +227,58 @@ class RespondClient:
         data: bytes | io.IOBase,
         *,
         content_type: str = "application/octet-stream",
-        filename: str = "blob",
         ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
-        params: dict = {}
+        """Upload bytes or a file-like object as a blob.
+
+        Internally uses the two-step signed-URL flow:
+        1. POST /v1/blobs/uploads  → get signed PUT URL
+        2. PUT upload_url          → stream bytes (no Authorization header)
+
+        Returns the blob metadata dict with at minimum ``blob_id``.
+        """
+        alloc_body: dict = {"content_type": content_type}
         if ttl_seconds is not None:
-            params["ttl_seconds"] = ttl_seconds
-        resp = self._client.post(
-            self._url("blobs"),
-            files={"file": (filename, data, content_type)},
-            params=params,
+            alloc_body["ttl_seconds"] = ttl_seconds
+
+        alloc_resp = self._client.post(self._url("blobs/uploads"), json=alloc_body)
+        _raise_for_status(alloc_resp)
+        alloc = alloc_resp.json()
+
+        upload_url = alloc["upload_url"]
+        if isinstance(data, (bytes, bytearray)):
+            body_data = data
+        else:
+            body_data = data.read()  # type: ignore[union-attr]
+
+        put_resp = self._client.put(
+            upload_url,
+            content=body_data,
+            headers={"Content-Type": content_type},
             timeout=httpx.Timeout(connect=10, read=300, write=None, pool=10),
         )
+        _raise_for_status(put_resp)
+        blob = put_resp.json()
+        # Ensure blob_id is present (server returns it; fall back to allocated id)
+        blob.setdefault("blob_id", alloc["blob_id"])
+        return blob
+
+    def _get_download_url(self, blob_id: str) -> str:
+        """Mint a signed download URL via the server."""
+        resp = self._client.post(self._url(f"blobs/{blob_id}/downloads"))
         _raise_for_status(resp)
-        return resp.json()
+        return resp.json()["download_url"]
 
     def download_blob(self, blob_id: str) -> bytes:
-        resp = self._client.get(self._url(f"blobs/{blob_id}"), follow_redirects=True, timeout=120)
+        url = self._get_download_url(blob_id)
+        resp = self._client.get(url, follow_redirects=True, timeout=120)
         _raise_for_status(resp)
         return resp.content
 
     def stream_blob_to_file(self, blob_id: str, dest_path: str, chunk_size: int = 65536) -> None:
         """Stream a blob directly to *dest_path* without buffering in memory."""
-        with self._client.stream(
-            "GET", self._url(f"blobs/{blob_id}"), follow_redirects=True, timeout=120
-        ) as resp:
+        url = self._get_download_url(blob_id)
+        with self._client.stream("GET", url, follow_redirects=True, timeout=120) as resp:
             if not resp.is_success:
                 resp.read()
                 _raise_for_status(resp)
@@ -349,25 +378,44 @@ class RespondClient:
         data: bytes | io.IOBase,
         *,
         content_type: str = "application/octet-stream",
-        filename: str = "blob",
         ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
-        params: dict = {}
+        """Async two-step signed-URL upload. Public surface unchanged."""
+        alloc_body: dict = {"content_type": content_type}
         if ttl_seconds is not None:
-            params["ttl_seconds"] = ttl_seconds
-        resp = await self._get_aclient().post(
-            self._url("blobs"),
-            files={"file": (filename, data, content_type)},
-            params=params,
+            alloc_body["ttl_seconds"] = ttl_seconds
+
+        alloc_resp = await self._get_aclient().post(
+            self._url("blobs/uploads"), json=alloc_body
+        )
+        _raise_for_status(alloc_resp)
+        alloc = alloc_resp.json()
+
+        upload_url = alloc["upload_url"]
+        if isinstance(data, (bytes, bytearray)):
+            body_data = data
+        else:
+            body_data = data.read()  # type: ignore[union-attr]
+
+        put_resp = await self._get_aclient().put(
+            upload_url,
+            content=body_data,
+            headers={"Content-Type": content_type},
             timeout=httpx.Timeout(connect=10, read=300, write=None, pool=10),
         )
+        _raise_for_status(put_resp)
+        blob = put_resp.json()
+        blob.setdefault("blob_id", alloc["blob_id"])
+        return blob
+
+    async def _aget_download_url(self, blob_id: str) -> str:
+        resp = await self._get_aclient().post(self._url(f"blobs/{blob_id}/downloads"))
         _raise_for_status(resp)
-        return resp.json()
+        return resp.json()["download_url"]
 
     async def adownload_blob(self, blob_id: str) -> bytes:
-        resp = await self._get_aclient().get(
-            self._url(f"blobs/{blob_id}"), follow_redirects=True, timeout=120
-        )
+        url = await self._aget_download_url(blob_id)
+        resp = await self._get_aclient().get(url, follow_redirects=True, timeout=120)
         _raise_for_status(resp)
         return resp.content
 
@@ -377,8 +425,9 @@ class RespondClient:
         Raises RespondError subclasses on non-2xx responses before yielding any
         data, so callers can detect errors before committing to a 200 response.
         """
+        url = await self._aget_download_url(blob_id)
         async with self._get_aclient().stream(
-            "GET", self._url(f"blobs/{blob_id}"), follow_redirects=True, timeout=120
+            "GET", url, follow_redirects=True, timeout=120
         ) as resp:
             if not resp.is_success:
                 await resp.aread()
