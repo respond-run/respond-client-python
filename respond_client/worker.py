@@ -48,6 +48,7 @@ class JobContext:
     queue: str
     lease_token: str
     attempts: int
+    max_attempts: int
     _client: RespondClient
 
     def heartbeat(self, extend_seconds: int = 300) -> None:
@@ -71,6 +72,10 @@ class JobContext:
         """Upload bytes as a blob and return the blob_id."""
         resp = self._client.upload_blob(data, content_type=content_type)
         return resp["blob_id"]
+
+    def delete_blob(self, blob_id: str) -> None:
+        """Delete a blob by ID."""
+        self._client.delete_blob(blob_id)
 
 
 class Worker:
@@ -139,6 +144,7 @@ class Worker:
             queue=job["queue"],
             lease_token=lease_token,
             attempts=job["attempts"],
+            max_attempts=job.get("max_attempts", 3),
             _client=self._client,
         )
 
