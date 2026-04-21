@@ -206,3 +206,115 @@ class TestSchedules:
             "DELETE", "/v1/schedules/my-sched", _json_resp({"ok": True})
         )
         client.delete_schedule("my-sched")
+
+
+class TestAuthTokenOverride:
+    """Tests for per-call auth_token kwarg."""
+
+    def _captured_transport(self):
+        """Return a transport that records the last request."""
+        captured = {}
+
+        class CapturingTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                captured["last"] = request
+                return httpx.Response(202, json=_job())
+
+        return CapturingTransport(), captured
+
+    def _client_with_default_key(self, transport) -> RespondClient:
+        c = RespondClient.__new__(RespondClient)
+        c._base = "http://testserver"
+        c._headers = {"Authorization": "Bearer default-key"}
+        c._timeout = 10.0
+        c._client = httpx.Client(transport=transport, headers=c._headers, base_url="http://testserver")
+        c._aclient = None
+        return c
+
+    def test_auth_token_sent_on_submit(self):
+        transport, captured = self._captured_transport()
+        c = RespondClient.__new__(RespondClient)
+        c._base = "http://testserver"
+        c._headers = {}
+        c._timeout = 10.0
+        c._client = httpx.Client(transport=transport, base_url="http://testserver")
+        c._aclient = None
+
+        c.submit("test.kind", auth_token="caller-token-abc")
+        assert captured["last"].headers.get("authorization") == "Bearer caller-token-abc"
+
+    def test_auth_token_overrides_default_api_key(self):
+        transport, captured = self._captured_transport()
+        c = self._client_with_default_key(transport)
+
+        c.submit("test.kind", auth_token="per-call-token")
+        assert captured["last"].headers.get("authorization") == "Bearer per-call-token"
+
+    def test_no_auth_token_falls_back_to_default(self):
+        transport, captured = self._captured_transport()
+        c = self._client_with_default_key(transport)
+
+        c.submit("test.kind")
+        assert captured["last"].headers.get("authorization") == "Bearer default-key"
+
+    def test_auth_token_on_get_job(self, transport, client):
+        transport.register("GET", "/v1/jobs/job-1", _json_resp(_job("job-1")))
+        client.get_job("job-1", auth_token="tok-xyz")
+
+    def test_auth_token_on_delete_blob(self, transport, client):
+        transport.register("DELETE", "/v1/blobs/blob-1", _json_resp({"ok": True}))
+        client.delete_blob("blob-1", auth_token="tok-xyz")
+
+    def test_auth_token_on_heartbeat(self, transport, client):
+        transport.register("POST", "/v1/jobs/job-1/heartbeat", _json_resp({"ok": True}))
+        client.heartbeat("job-1", "lease-tok", 300, auth_token="tok-xyz")
+
+    def test_auth_token_on_complete(self, transport, client):
+        transport.register("POST", "/v1/jobs/job-1/complete", _json_resp({"ok": True}))
+        client.complete("job-1", "lease-tok", auth_token="tok-xyz")
+
+    def test_auth_token_on_fail(self, transport, client):
+        transport.register("POST", "/v1/jobs/job-1/fail", _json_resp({"ok": True}))
+        client.fail("job-1", "lease-tok", "oops", auth_token="tok-xyz")
+
+    def test_auth_token_sent_on_blob_upload_alloc_not_put(self):
+        """auth_token applies to the allocation POST, not the signed-URL PUT."""
+        alloc_captured = {}
+        put_captured = {}
+
+        class SplitTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                if request.method == "POST":
+                    alloc_captured["auth"] = request.headers.get("authorization")
+                    return httpx.Response(200, json={
+                        "blob_id": "b-1",
+                        "upload_url": "http://testserver/v1/blobs/b-1/upload?token=t&exp=9999999999",
+                        "expires_at": _now(),
+                    })
+                # PUT — signed URL, no auth expected
+                put_captured["auth"] = request.headers.get("authorization")
+                return httpx.Response(201, json={"blob_id": "b-1", "size_bytes": 5})
+
+        c = RespondClient.__new__(RespondClient)
+        c._base = "http://testserver"
+        c._headers = {}
+        c._timeout = 10.0
+        c._client = httpx.Client(transport=SplitTransport(), base_url="http://testserver")
+        c._aclient = None
+
+        c.upload_blob(b"hello", auth_token="alloc-token")
+        assert alloc_captured.get("auth") == "Bearer alloc-token"
+        # The signed-URL PUT carries the Content-Type header but not the auth override.
+        assert put_captured.get("auth") is None
+
+    def test_none_auth_token_no_header_added(self):
+        transport, captured = self._captured_transport()
+        c = RespondClient.__new__(RespondClient)
+        c._base = "http://testserver"
+        c._headers = {}
+        c._timeout = 10.0
+        c._client = httpx.Client(transport=transport, base_url="http://testserver")
+        c._aclient = None
+
+        c.submit("test.kind", auth_token=None)
+        assert "authorization" not in captured["last"].headers

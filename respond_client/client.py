@@ -38,6 +38,13 @@ def _raise_for_status(resp: httpx.Response) -> None:
     raise RespondError(detail, status_code=sc)
 
 
+def _override_headers(auth_token: str | None) -> dict[str, str]:
+    """Return a per-request Authorization header dict, or empty if no override."""
+    if auth_token:
+        return {"Authorization": f"Bearer {auth_token}"}
+    return {}
+
+
 class RespondClient:
     """Synchronous + async low-level client for the respond API.
 
@@ -48,6 +55,18 @@ class RespondClient:
 
     Usage (async):
         job = await c.asubmit("my.kind", payload={"x": 1})
+
+    Per-call ``auth_token`` override
+    ---------------------------------
+    Every API method accepts an optional ``auth_token`` keyword argument.  When
+    supplied, that token is sent as ``Authorization: Bearer <auth_token>`` for
+    that single call, overriding the client-default ``api_key``.  This lets a
+    shared, pooled client forward per-request caller credentials without
+    rebuilding the client.
+
+    For two-step blob flows the override applies only to the authenticated
+    step (the allocation ``POST``); the subsequent signed-URL ``PUT``/``GET``
+    is always unauthenticated, matching the server's expectation.
     """
 
     def __init__(
@@ -114,6 +133,7 @@ class RespondClient:
         timeout_seconds: int = 300,
         idempotency_key: str | None = None,
         ttl_seconds: int | None = None,
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
         body: dict = {
             "kind": kind,
@@ -129,12 +149,12 @@ class RespondClient:
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
 
-        resp = self._client.post(self._url("jobs"), json=body)
+        resp = self._client.post(self._url("jobs"), json=body, headers=_override_headers(auth_token))
         _raise_for_status(resp)
         return resp.json()
 
-    def get_job(self, job_id: str) -> dict[str, Any]:
-        resp = self._client.get(self._url(f"jobs/{job_id}"))
+    def get_job(self, job_id: str, *, auth_token: str | None = None) -> dict[str, Any]:
+        resp = self._client.get(self._url(f"jobs/{job_id}"), headers=_override_headers(auth_token))
         _raise_for_status(resp)
         return resp.json()
 
@@ -146,6 +166,7 @@ class RespondClient:
         queue: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
         params: dict = {"limit": limit, "offset": offset}
         if status:
@@ -154,12 +175,16 @@ class RespondClient:
             params["kind"] = kind
         if queue:
             params["queue"] = queue
-        resp = self._client.get(self._url("jobs"), params=params)
+        resp = self._client.get(
+            self._url("jobs"), params=params, headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
         return resp.json()
 
-    def cancel_job(self, job_id: str) -> None:
-        resp = self._client.delete(self._url(f"jobs/{job_id}"))
+    def cancel_job(self, job_id: str, *, auth_token: str | None = None) -> None:
+        resp = self._client.delete(
+            self._url(f"jobs/{job_id}"), headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
 
     # ── Leases ────────────────────────────────────────────────────────────────
@@ -171,6 +196,7 @@ class RespondClient:
         kinds: list[str] | None = None,
         wait_seconds: int = 30,
         lease_seconds: int = 300,
+        auth_token: str | None = None,
     ) -> dict[str, Any] | None:
         """Long-poll for the next available job. Returns None if none available."""
         body: dict = {
@@ -181,16 +207,29 @@ class RespondClient:
             body["queues"] = queues
         if kinds is not None:
             body["kinds"] = kinds
-        resp = self._client.post(self._url("leases"), json=body, timeout=wait_seconds + 10)
+        resp = self._client.post(
+            self._url("leases"),
+            json=body,
+            timeout=wait_seconds + 10,
+            headers=_override_headers(auth_token),
+        )
         if resp.status_code == 204:
             return None
         _raise_for_status(resp)
         return resp.json()
 
-    def heartbeat(self, job_id: str, lease_token: str, extend_seconds: int = 300) -> None:
+    def heartbeat(
+        self,
+        job_id: str,
+        lease_token: str,
+        extend_seconds: int = 300,
+        *,
+        auth_token: str | None = None,
+    ) -> None:
         resp = self._client.post(
             self._url(f"jobs/{job_id}/heartbeat"),
             json={"lease_token": lease_token, "extend_seconds": extend_seconds},
+            headers=_override_headers(auth_token),
         )
         _raise_for_status(resp)
 
@@ -202,6 +241,7 @@ class RespondClient:
         result: dict | None = None,
         result_blob_id: str | None = None,
         timings: dict | None = None,
+        auth_token: str | None = None,
     ) -> None:
         body: dict = {"lease_token": lease_token}
         if result is not None:
@@ -210,13 +250,24 @@ class RespondClient:
             body["result_blob_id"] = result_blob_id
         if timings:
             body["timings"] = timings
-        resp = self._client.post(self._url(f"jobs/{job_id}/complete"), json=body)
+        resp = self._client.post(
+            self._url(f"jobs/{job_id}/complete"), json=body, headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
 
-    def fail(self, job_id: str, lease_token: str, error: str, retryable: bool = True) -> None:
+    def fail(
+        self,
+        job_id: str,
+        lease_token: str,
+        error: str,
+        retryable: bool = True,
+        *,
+        auth_token: str | None = None,
+    ) -> None:
         resp = self._client.post(
             self._url(f"jobs/{job_id}/fail"),
             json={"lease_token": lease_token, "error": error, "retryable": retryable},
+            headers=_override_headers(auth_token),
         )
         _raise_for_status(resp)
 
@@ -228,11 +279,12 @@ class RespondClient:
         *,
         content_type: str = "application/octet-stream",
         ttl_seconds: int | None = None,
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
         """Upload bytes or a file-like object as a blob.
 
         Internally uses the two-step signed-URL flow:
-        1. POST /v1/blobs/uploads  → get signed PUT URL
+        1. POST /v1/blobs/uploads  → get signed PUT URL  (uses auth_token if provided)
         2. PUT upload_url          → stream bytes (no Authorization header)
 
         Returns the blob metadata dict with at minimum ``blob_id``.
@@ -241,7 +293,9 @@ class RespondClient:
         if ttl_seconds is not None:
             alloc_body["ttl_seconds"] = ttl_seconds
 
-        alloc_resp = self._client.post(self._url("blobs/uploads"), json=alloc_body)
+        alloc_resp = self._client.post(
+            self._url("blobs/uploads"), json=alloc_body, headers=_override_headers(auth_token)
+        )
         _raise_for_status(alloc_resp)
         alloc = alloc_resp.json()
 
@@ -263,21 +317,30 @@ class RespondClient:
         blob.setdefault("blob_id", alloc["blob_id"])
         return blob
 
-    def _get_download_url(self, blob_id: str) -> str:
+    def _get_download_url(self, blob_id: str, *, auth_token: str | None = None) -> str:
         """Mint a signed download URL via the server."""
-        resp = self._client.post(self._url(f"blobs/{blob_id}/downloads"))
+        resp = self._client.post(
+            self._url(f"blobs/{blob_id}/downloads"), headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
         return resp.json()["download_url"]
 
-    def download_blob(self, blob_id: str) -> bytes:
-        url = self._get_download_url(blob_id)
+    def download_blob(self, blob_id: str, *, auth_token: str | None = None) -> bytes:
+        url = self._get_download_url(blob_id, auth_token=auth_token)
         resp = self._client.get(url, follow_redirects=True, timeout=120)
         _raise_for_status(resp)
         return resp.content
 
-    def stream_blob_to_file(self, blob_id: str, dest_path: str, chunk_size: int = 65536) -> None:
+    def stream_blob_to_file(
+        self,
+        blob_id: str,
+        dest_path: str,
+        chunk_size: int = 65536,
+        *,
+        auth_token: str | None = None,
+    ) -> None:
         """Stream a blob directly to *dest_path* without buffering in memory."""
-        url = self._get_download_url(blob_id)
+        url = self._get_download_url(blob_id, auth_token=auth_token)
         with self._client.stream("GET", url, follow_redirects=True, timeout=120) as resp:
             if not resp.is_success:
                 resp.read()
@@ -286,8 +349,10 @@ class RespondClient:
                 for chunk in resp.iter_bytes(chunk_size=chunk_size):
                     f.write(chunk)
 
-    def delete_blob(self, blob_id: str) -> None:
-        resp = self._client.delete(self._url(f"blobs/{blob_id}"))
+    def delete_blob(self, blob_id: str, *, auth_token: str | None = None) -> None:
+        resp = self._client.delete(
+            self._url(f"blobs/{blob_id}"), headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
 
     # ── Schedules ─────────────────────────────────────────────────────────────
@@ -329,6 +394,7 @@ class RespondClient:
         timeout_seconds: int = 300,
         idempotency_key: str | None = None,
         ttl_seconds: int | None = None,
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
         body: dict = {
             "kind": kind,
@@ -343,12 +409,16 @@ class RespondClient:
             body["idempotency_key"] = idempotency_key
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
-        resp = await self._get_aclient().post(self._url("jobs"), json=body)
+        resp = await self._get_aclient().post(
+            self._url("jobs"), json=body, headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
         return resp.json()
 
-    async def aget_job(self, job_id: str) -> dict[str, Any]:
-        resp = await self._get_aclient().get(self._url(f"jobs/{job_id}"))
+    async def aget_job(self, job_id: str, *, auth_token: str | None = None) -> dict[str, Any]:
+        resp = await self._get_aclient().get(
+            self._url(f"jobs/{job_id}"), headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
         return resp.json()
 
@@ -359,6 +429,7 @@ class RespondClient:
         kinds: list[str] | None = None,
         wait_seconds: int = 30,
         lease_seconds: int = 300,
+        auth_token: str | None = None,
     ) -> dict[str, Any] | None:
         body: dict = {"wait_seconds": wait_seconds, "lease_seconds": lease_seconds}
         if queues is not None:
@@ -366,7 +437,10 @@ class RespondClient:
         if kinds is not None:
             body["kinds"] = kinds
         resp = await self._get_aclient().post(
-            self._url("leases"), json=body, timeout=wait_seconds + 10
+            self._url("leases"),
+            json=body,
+            timeout=wait_seconds + 10,
+            headers=_override_headers(auth_token),
         )
         if resp.status_code == 204:
             return None
@@ -379,14 +453,19 @@ class RespondClient:
         *,
         content_type: str = "application/octet-stream",
         ttl_seconds: int | None = None,
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
-        """Async two-step signed-URL upload. Public surface unchanged."""
+        """Async two-step signed-URL upload.
+
+        *auth_token* applies only to the allocation ``POST``; the signed-URL
+        ``PUT`` is always unauthenticated.
+        """
         alloc_body: dict = {"content_type": content_type}
         if ttl_seconds is not None:
             alloc_body["ttl_seconds"] = ttl_seconds
 
         alloc_resp = await self._get_aclient().post(
-            self._url("blobs/uploads"), json=alloc_body
+            self._url("blobs/uploads"), json=alloc_body, headers=_override_headers(auth_token)
         )
         _raise_for_status(alloc_resp)
         alloc = alloc_resp.json()
@@ -408,24 +487,35 @@ class RespondClient:
         blob.setdefault("blob_id", alloc["blob_id"])
         return blob
 
-    async def _aget_download_url(self, blob_id: str) -> str:
-        resp = await self._get_aclient().post(self._url(f"blobs/{blob_id}/downloads"))
+    async def _aget_download_url(
+        self, blob_id: str, *, auth_token: str | None = None
+    ) -> str:
+        resp = await self._get_aclient().post(
+            self._url(f"blobs/{blob_id}/downloads"), headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
         return resp.json()["download_url"]
 
-    async def adownload_blob(self, blob_id: str) -> bytes:
-        url = await self._aget_download_url(blob_id)
+    async def adownload_blob(
+        self, blob_id: str, *, auth_token: str | None = None
+    ) -> bytes:
+        url = await self._aget_download_url(blob_id, auth_token=auth_token)
         resp = await self._get_aclient().get(url, follow_redirects=True, timeout=120)
         _raise_for_status(resp)
         return resp.content
 
-    async def astream_blob(self, blob_id: str, chunk_size: int = 65536):
+    async def astream_blob(
+        self, blob_id: str, chunk_size: int = 65536, *, auth_token: str | None = None
+    ):
         """Stream a blob in chunks without buffering the full content in memory.
 
         Raises RespondError subclasses on non-2xx responses before yielding any
         data, so callers can detect errors before committing to a 200 response.
+
+        *auth_token* applies only to the ``POST /blobs/{id}/downloads``
+        allocation; the subsequent signed-URL ``GET`` is unauthenticated.
         """
-        url = await self._aget_download_url(blob_id)
+        url = await self._aget_download_url(blob_id, auth_token=auth_token)
         async with self._get_aclient().stream(
             "GET", url, follow_redirects=True, timeout=120
         ) as resp:
@@ -435,6 +525,8 @@ class RespondClient:
             async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
                 yield chunk
 
-    async def adelete_blob(self, blob_id: str) -> None:
-        resp = await self._get_aclient().delete(self._url(f"blobs/{blob_id}"))
+    async def adelete_blob(self, blob_id: str, *, auth_token: str | None = None) -> None:
+        resp = await self._get_aclient().delete(
+            self._url(f"blobs/{blob_id}"), headers=_override_headers(auth_token)
+        )
         _raise_for_status(resp)
